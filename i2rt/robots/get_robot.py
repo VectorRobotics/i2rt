@@ -107,6 +107,7 @@ def get_yam_robot(
     ee_mass: Optional[float] = None,
     ee_inertia: Optional[np.ndarray] = None,
     sim: bool = False,
+    limit_gripper_force: float = 50.0,
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
 ) -> "MotorChainRobot":
@@ -229,7 +230,7 @@ def get_yam_robot(
             gripper_limits=gripper_limits,
             enable_gripper_calibration=gripper_needs_cal,
             gripper_type=gripper_type,
-            limit_gripper_force=50.0,
+            limit_gripper_force=limit_gripper_force,
         )
     return get_robot()
 
