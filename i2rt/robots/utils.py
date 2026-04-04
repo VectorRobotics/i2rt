@@ -455,10 +455,7 @@ class GripperForceLimiter:
         (self.clog_force_threshold, self.clog_speed_threshold, self.sign, _gripper_force_torque_map) = (
             self.gripper_type.get_gripper_limiter_params()
         )
-        self.gripper_force_torque_map = partial(
-            _gripper_force_torque_map,
-            gripper_force=self.max_force,
-        )
+        self._force_torque_map_fn = _gripper_force_torque_map
 
     def compute_target_gripper_torque(self, gripper_state: Dict[str, float]) -> float:
         current_speed = gripper_state["current_qvel"]
@@ -481,7 +478,8 @@ class GripperForceLimiter:
             self._is_clogged = True
 
         if self._is_clogged:
-            target_eff = self.gripper_force_torque_map(current_angle=gripper_state["current_qpos"])
+            target_eff = self._force_torque_map_fn(
+                gripper_force=self.max_force, current_angle=gripper_state["current_qpos"])
             self._is_clogged = True
             return target_eff + 0.3  # this is to compensate the friction
         else:
