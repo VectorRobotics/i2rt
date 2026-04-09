@@ -33,7 +33,7 @@ CONTROL_PERIOD = 1.0 / CONTROL_FREQ  # 4 ms
 
 EXPECTED_CONTROL_PERIOD = 0.007
 REPORT_INTERVAL = 30.0
-MAX_CONSECUTIVE_COMM_FAILURES = 10
+MAX_CONSECUTIVE_COMM_FAILURES = 250
 
 
 class ControlMode:
@@ -596,11 +596,6 @@ class DMChainCanInterface(MotorChain):
                         f"Motor {idx} ({motor_info}) failed {MAX_CONSECUTIVE_COMM_FAILURES} times consecutively, aborting"
                     )
                     raise
-                # Clear sticky error flag and re-enable motor so next cycle succeeds
-                try:
-                    self.motor_interface.motor_on(motor_id, motor_type)
-                except Exception:
-                    pass
                 fd_back = self.state[idx]
 
             motor_feedback.append(fd_back)
