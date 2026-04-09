@@ -33,6 +33,7 @@ CONTROL_PERIOD = 1.0 / CONTROL_FREQ  # 4 ms
 
 EXPECTED_CONTROL_PERIOD = 0.007
 REPORT_INTERVAL = 30.0
+MAX_CONSECUTIVE_COMM_FAILURES = 10
 
 
 class ControlMode:
@@ -427,6 +428,8 @@ class DMChainCanInterface(MotorChain):
         self.commands = starting_command
         self.command_lock = threading.Lock()
 
+        self._consecutive_comm_failures = np.zeros(len(motor_list), dtype=int)
+
         self.start_thread_flag = start_thread
         if start_thread:
             self.start_thread()
@@ -581,9 +584,24 @@ class DMChainCanInterface(MotorChain):
                     kd=kd,
                     torque=torque,
                 )
-            except Exception as e:
-                logging.error(f"{idx}th motor at DMChainCanInterface {self} failed with info {motor_info}")
-                raise e
+                self._consecutive_comm_failures[idx] = 0
+            except RuntimeError as e:
+                self._consecutive_comm_failures[idx] += 1
+                logging.warning(
+                    f"Transient error on motor {idx} ({motor_info}), "
+                    f"failure {self._consecutive_comm_failures[idx]}/{MAX_CONSECUTIVE_COMM_FAILURES}: {e}"
+                )
+                if self._consecutive_comm_failures[idx] >= MAX_CONSECUTIVE_COMM_FAILURES:
+                    logging.error(
+                        f"Motor {idx} ({motor_info}) failed {MAX_CONSECUTIVE_COMM_FAILURES} times consecutively, aborting"
+                    )
+                    raise
+                # Clear sticky error flag and re-enable motor so next cycle succeeds
+                try:
+                    self.motor_interface.motor_on(motor_id, motor_type)
+                except Exception:
+                    pass
+                fd_back = self.state[idx]
 
             motor_feedback.append(fd_back)
         return motor_feedback

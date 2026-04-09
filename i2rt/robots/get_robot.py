@@ -110,6 +110,7 @@ def get_yam_robot(
     limit_gripper_force: float = 50.0,
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
+    enable_gripper_calibration: Optional[bool] = None,
 ) -> "MotorChainRobot":
     """Create a YAM-family robot (real or sim).
 
@@ -151,7 +152,10 @@ def get_yam_robot(
         kd = np.append(kd, gripper_kd)
 
     gripper_limits = gripper_type.get_gripper_limits() if with_gripper else None
-    gripper_needs_cal = gripper_type.get_gripper_needs_calibration() if with_gripper else False
+    if enable_gripper_calibration is not None:
+        gripper_needs_cal = enable_gripper_calibration
+    else:
+        gripper_needs_cal = gripper_type.get_gripper_needs_calibration() if with_gripper else False
 
     if sim:
         from i2rt.robots.sim_robot import SimRobot
@@ -196,6 +200,13 @@ def get_yam_robot(
 
     time.sleep(0.5)
     logging.info(f"adjusted motor_offsets: {motor_offsets}")
+
+    # When calibration is skipped for a gripper that normally needs it,
+    # use the current motor position as the closed limit.
+    if with_gripper and gripper_limits is None and not gripper_needs_cal:
+        gripper_pos = motor_states[len(motor_list) - 1].pos
+        gripper_limits = (gripper_pos, gripper_pos + 1.0)
+        logging.info(f"Skipping gripper calibration — using limits: {gripper_limits}")
 
     # Second pass: start the control loop with corrected offsets.
     motor_chain = DMChainCanInterface(
