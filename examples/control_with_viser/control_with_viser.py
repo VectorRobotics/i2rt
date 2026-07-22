@@ -22,7 +22,7 @@ from i2rt.robots.utils import ArmType, GripperType
 from i2rt.utils.viser_control_interface import ViserControlInterface
 
 if __name__ == "__main__":
-    arm_choices = [a.value for a in ArmType]
+    arm_choices = [a.value for a in ArmType if a != ArmType.NO_ARM]
     gripper_choices = [g.value for g in GripperType]
 
     parser = argparse.ArgumentParser(description="Viser control interface for i2rt robots")
@@ -33,6 +33,11 @@ if __name__ == "__main__":
     parser.add_argument("--dt", type=float, default=0.02, help="Loop timestep (s)")
     parser.add_argument("--port", type=int, default=8080, help="Viser server port")
     parser.add_argument("--site", type=str, default=None, help="EE site name (auto-detected if omitted)")
+    parser.add_argument(
+        "--friction",
+        action="store_true",
+        help="Enable Coulomb friction compensation in gravity comp (real hardware only)",
+    )
     args = parser.parse_args()
 
     arm = ArmType.from_string_name(args.arm)
@@ -50,6 +55,7 @@ if __name__ == "__main__":
         arm_type=arm,
         gripper_type=gripper,
         sim=args.sim,
+        use_coulomb_friction=args.friction,
     )
 
     iface = ViserControlInterface.from_robot(robot, ee_site=site, dt=args.dt, port=args.port)

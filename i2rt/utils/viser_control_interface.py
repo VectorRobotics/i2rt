@@ -19,9 +19,18 @@ from typing import Any, Dict, List, Optional
 import mujoco
 import numpy as np
 
+from i2rt.motor_drivers.dm_driver import PassiveEncoderInfo
 from i2rt.robots.kinematics import Kinematics
 from i2rt.robots.motor_chain_robot import MotorChainRobot
 from i2rt.robots.robot import Robot
+
+# Teaching-handle button indicator visuals (mirrors mujoco_control_interface.py)
+_BTN_OFF_RGB = (89, 89, 89)
+_BTN_ON_RGB = (26, 230, 26)
+_BTN_RADIUS = 0.022
+# World-vertical offsets (meters along +Z) above the TCP. Index 0 = SYNC (top), 1 = RECORD (bottom).
+_BTN_Z_OFFSETS = [0.10, 0.04]
+_BTN_LABELS = ["SYNC", "RECORD"]
 
 
 class ViserControlInterface:
@@ -63,11 +72,17 @@ class ViserControlInterface:
         self._kd: np.ndarray = info.get("kd", np.full(n, 1.0)).copy()
         self._gripper_index: Optional[int] = info.get("gripper_index")
         self._gripper_limits: Optional[np.ndarray] = info.get("gripper_limits")
+        self._is_sim: bool = info.get("sim", False)
+        # tcp_site is exclusive to the teaching handle; covers sim where motor_chain is absent.
+        self._with_teaching_handle: bool = ee_site == "tcp_site" or self._has_teaching_handle(robot)
 
         # Mesh data — filled by _collect_mesh_geoms()
         self._mesh_geom_ids: List[int] = []
         self._mesh_local_verts: Dict[int, np.ndarray] = {}
         self._mesh_local_faces: Dict[int, np.ndarray] = {}
+
+        self._check_data = mujoco.MjData(self._model)
+        self._in_collision = False
 
     @classmethod
     def from_robot(
@@ -91,6 +106,9 @@ class ViserControlInterface:
         mujoco.mj_forward(self._model, self._data)
 
     def _denormalize_slide_joints(self, n_set: int) -> None:
+        self._denormalize_slide_joints_on(self._data, n_set)
+
+    def _denormalize_slide_joints_on(self, data: mujoco.MjData, n_set: int) -> None:
         """Scale normalised [0,1] slide-joint values to physical range (metres)."""
         for j in range(self._model.njnt):
             adr = self._model.jnt_qposadr[j]
@@ -98,9 +116,12 @@ class ViserControlInterface:
                 continue
             if self._model.jnt_type[j] == mujoco.mjtJoint.mjJNT_SLIDE:
                 lo, hi = self._model.jnt_range[j]
-                self._data.qpos[adr] = lo + self._data.qpos[adr] * (hi - lo)
+                data.qpos[adr] = lo + data.qpos[adr] * (hi - lo)
 
     def _enforce_eq_constraints(self) -> None:
+        self._enforce_eq_constraints_on(self._data)
+
+    def _enforce_eq_constraints_on(self, data: mujoco.MjData) -> None:
         """Project qpos to satisfy joint equality constraints (e.g. coupled fingers)."""
         for i in range(self._model.neq):
             if self._model.eq_type[i] != mujoco.mjtEq.mjEQ_JOINT:
@@ -108,7 +129,49 @@ class ViserControlInterface:
             adr1 = self._model.jnt_qposadr[self._model.eq_obj1id[i]]
             adr2 = self._model.jnt_qposadr[self._model.eq_obj2id[i]]
             coef = self._model.eq_data[i, :5]
-            self._data.qpos[adr2] = np.polyval(coef[::-1], self._data.qpos[adr1])
+            data.qpos[adr2] = np.polyval(coef[::-1], data.qpos[adr1])
+
+    def _has_self_collision(self, target_q: np.ndarray, n: int) -> bool:
+        """Return True if *target_q* would cause self-collision.
+
+        Uses a scratch ``MjData`` so the render state is not corrupted.
+        Contacts involving the ground plane or adjacent (parent-child) bodies
+        are ignored — only unexpected link-link penetrations count.
+        """
+        self._check_data.qpos[:n] = target_q[:n]
+        self._denormalize_slide_joints_on(self._check_data, n)
+        self._enforce_eq_constraints_on(self._check_data)
+        mujoco.mj_forward(self._model, self._check_data)
+        for i in range(self._check_data.ncon):
+            c = self._check_data.contact[i]
+            if c.dist >= -1e-3:
+                continue
+            if (
+                self._model.geom_type[c.geom1] == mujoco.mjtGeom.mjGEOM_PLANE
+                or self._model.geom_type[c.geom2] == mujoco.mjtGeom.mjGEOM_PLANE
+            ):
+                continue
+            b1 = self._model.geom_bodyid[c.geom1]
+            b2 = self._model.geom_bodyid[c.geom2]
+            if self._model.body_parentid[b1] == b2 or self._model.body_parentid[b2] == b1:
+                continue
+            return True
+        return False
+
+    def _enter_vis_grav_comp(self) -> None:
+        """Restore grav-comp on returning to VIS — sim resumes physics, real
+        clears any lingering PD command."""
+        if hasattr(self._robot, "enable_gravity_comp"):
+            self._robot.enable_gravity_comp()
+        elif hasattr(self._robot, "enter_gravity_comp_idle"):
+            self._robot.enter_gravity_comp_idle()
+
+    def _enter_control_grav_comp(self) -> None:
+        """Pause sim grav-comp so CONTROL mode can teleport. On real, the next
+        ``command_joint_pos`` implicitly switches to PD — no call needed here."""
+        if hasattr(self._robot, "disable_gravity_comp"):
+            self._robot.disable_gravity_comp()
+        self._in_collision = False
 
     @staticmethod
     def _mat3_to_wxyz(mat3: np.ndarray) -> np.ndarray:
@@ -185,6 +248,37 @@ class ViserControlInterface:
                 ranges.append((float(np.degrees(lo)), float(np.degrees(hi))))
         return ranges
 
+    # ---- Teaching-handle helpers ---------------------------------------------
+
+    @staticmethod
+    def _has_teaching_handle(robot: Robot) -> bool:
+        """Return True if robot has a teaching handle (passive encoder on the same CAN bus)."""
+        chain = getattr(robot, "motor_chain", None)
+        if chain is None:
+            return False
+        return (
+            hasattr(chain, "get_same_bus_device_states")
+            and hasattr(chain, "same_bus_device_driver")
+            and chain.same_bus_device_driver is not None
+        )
+
+    def _get_teaching_handle_state(self) -> Optional[PassiveEncoderInfo]:
+        """Read the latest teaching-handle encoder snapshot, or None if unavailable."""
+        if self._is_sim:
+            return None
+        chain = getattr(self._robot, "motor_chain", None)
+        if chain is None or not hasattr(chain, "get_same_bus_device_states"):
+            return None
+        if getattr(chain, "same_bus_device_driver", None) is None:
+            return None
+        states = chain.get_same_bus_device_states()
+        return states[0] if states else None
+
+    def _get_button_states(self) -> Optional[List[bool]]:
+        """Read teaching-handle button states from real hardware, or None if unavailable."""
+        state = self._get_teaching_handle_state()
+        return list(state.io_inputs) if state is not None else None
+
     # ---- Main -----------------------------------------------------------------
 
     def run(self) -> None:
@@ -206,6 +300,39 @@ class ViserControlInterface:
             scale=0.15,
             visible=False,
         )
+
+        # Teaching-handle button spheres: viser icospheres are immutable in colour, so
+        # add an "off" (gray) and "on" (green) sphere per position and toggle visibility.
+        # Positions are refreshed each frame to track the TCP along world +Z.
+        btn_spheres_off: List[Any] = []
+        btn_spheres_on: List[Any] = []
+        if self._with_teaching_handle:
+            for i in range(len(_BTN_LABELS)):
+                btn_spheres_off.append(
+                    server.scene.add_icosphere(
+                        f"/teaching_handle/btn_{i}_off",
+                        radius=_BTN_RADIUS,
+                        color=_BTN_OFF_RGB,
+                        visible=True,
+                    )
+                )
+                btn_spheres_on.append(
+                    server.scene.add_icosphere(
+                        f"/teaching_handle/btn_{i}_on",
+                        radius=_BTN_RADIUS,
+                        color=_BTN_ON_RGB,
+                        visible=False,
+                    )
+                )
+
+        # ---- Initial camera — start zoomed in on the arm ---------------------
+        # Viser's default framing sits far back; pull each new client's camera
+        # close to the arm so the robot fills the view on first load. Users can
+        # still orbit/zoom freely afterwards.
+        @server.on_client_connect
+        def _set_initial_camera(client: viser.ClientHandle) -> None:
+            client.camera.position = (0.55, 0.55, 0.45)
+            client.camera.look_at = (0.0, 0.0, 0.2)
 
         # ---- Shared mutable state (read by loop, written by callbacks) --------
         state: Dict[str, Any] = {"enabled": False, "mode": "vis"}
@@ -246,6 +373,18 @@ class ViserControlInterface:
             with server.gui.add_folder("Gripper"):
                 gripper_slider = server.gui.add_slider("Position", min=0.0, max=1.0, step=0.01, initial_value=0.0)
                 gripper_slider.disabled = True
+
+        # ---- GUI — teaching-handle indicators -------------------------------
+        handle_btn_md: List[Any] = []
+        handle_grip_slider: Optional[Any] = None
+        if self._with_teaching_handle:
+            with server.gui.add_folder("Teaching Handle"):
+                for label in _BTN_LABELS:
+                    handle_btn_md.append(server.gui.add_markdown(f"**{label}** [○]"))
+                handle_grip_slider = server.gui.add_slider(
+                    "Gripper Position", min=0.0, max=1.0, step=0.01, initial_value=0.0
+                )
+                handle_grip_slider.disabled = True
 
         # ---- GUI — PD gains --------------------------------------------------
         kp_sliders: List[Any] = []
@@ -339,6 +478,7 @@ class ViserControlInterface:
                 print(f"[viser] Gains applied: kp={new_kp.tolist()}, kd={new_kd.tolist()}")
 
         # ---- Main loop -------------------------------------------------------
+        prev_controlled = False
         try:
             while True:
                 self._mirror_robot()
@@ -349,6 +489,33 @@ class ViserControlInterface:
                 ee_frame.position = T[:3, 3]
                 ee_frame.wxyz = self._mat3_to_wxyz(T[:3, :3])
 
+                if self._with_teaching_handle:
+                    handle_state = self._get_teaching_handle_state()
+                    buttons = list(handle_state.io_inputs) if handle_state is not None else [False, False]
+                    for i, md in enumerate(handle_btn_md):
+                        pressed = bool(buttons[i]) if i < len(buttons) else False
+                        marker = "[●]" if pressed else "[○]"
+                        md.content = f"**{_BTN_LABELS[i]}** {marker}"
+                    ee_pos = T[:3, 3]
+                    for i in range(len(btn_spheres_off)):
+                        pressed = bool(buttons[i]) if i < len(buttons) else False
+                        sphere_pos = ee_pos + np.array([0.0, 0.0, _BTN_Z_OFFSETS[i]])
+                        btn_spheres_off[i].position = sphere_pos
+                        btn_spheres_on[i].position = sphere_pos
+                        btn_spheres_off[i].visible = not pressed
+                        btn_spheres_on[i].visible = pressed
+                    if handle_grip_slider is not None and handle_state is not None:
+                        handle_grip_slider.value = float(np.clip(1.0 - float(handle_state.position), 0.0, 1.0))
+
+                mode = state["mode"]
+                controlled = state["enabled"] and mode in ("ik", "joint")
+                if controlled != prev_controlled:
+                    if controlled:
+                        self._enter_control_grav_comp()
+                    else:
+                        self._enter_vis_grav_comp()
+                    prev_controlled = controlled
+
                 if not state["enabled"]:
                     # Read-only: update sliders to reflect live robot state
                     q = self._robot.get_joint_pos()
@@ -358,42 +525,57 @@ class ViserControlInterface:
                     if gripper_slider is not None and self._gripper_index is not None:
                         gripper_slider.value = float(q[self._gripper_index])
 
-                else:
-                    mode = state["mode"]
+                elif mode == "vis":
+                    # Mirror only — no commands
+                    q = self._robot.get_joint_pos()
+                    for i, s in enumerate(joint_sliders):
+                        if i < len(q):
+                            s.value = float(np.degrees(q[i]))
 
-                    if mode == "vis":
-                        # Mirror only — no commands
-                        q = self._robot.get_joint_pos()
-                        for i, s in enumerate(joint_sliders):
-                            if i < len(q):
-                                s.value = float(np.degrees(q[i]))
-
-                    elif mode == "ik":
-                        # Build target from user-dragged transform control
-                        target = np.eye(4)
-                        target[:3, 3] = np.asarray(ik_ctrl.position)
-                        target[:3, :3] = self._wxyz_to_mat3(np.asarray(ik_ctrl.wxyz))
-                        init_q = self._data.qpos[: self._nq].copy()
-                        _, ik_q = self._kin.ik(target, self._ee_site, init_q=init_q)
-                        cmd = self._robot.get_joint_pos().copy()
-                        cmd[: self._n_arm] = ik_q[: self._n_arm]
-                        if gripper_slider is not None and self._gripper_index is not None:
-                            cmd[self._gripper_index] = float(gripper_slider.value)
+                elif mode == "ik":
+                    # Build target from user-dragged transform control
+                    target = np.eye(4)
+                    target[:3, 3] = np.asarray(ik_ctrl.position)
+                    target[:3, :3] = self._wxyz_to_mat3(np.asarray(ik_ctrl.wxyz))
+                    init_q = self._data.qpos[: self._nq].copy()
+                    _, ik_q = self._kin.ik(target, self._ee_site, init_q=init_q)
+                    cmd = self._robot.get_joint_pos().copy()
+                    cmd[: self._n_arm] = ik_q[: self._n_arm]
+                    if gripper_slider is not None and self._gripper_index is not None:
+                        cmd[self._gripper_index] = float(gripper_slider.value)
+                    n = min(len(cmd), self._nq)
+                    if self._has_self_collision(cmd, n):
+                        if not self._in_collision:
+                            print("[viser] Collision detected — command blocked")
+                            self._in_collision = True
+                    else:
                         self._robot.command_joint_pos(cmd)
-                        # Reflect solved angles in sliders
-                        for i, s in enumerate(joint_sliders):
-                            if i < self._n_arm:
-                                s.value = float(np.degrees(ik_q[i]))
+                        if self._in_collision:
+                            print("[viser] Collision cleared — commands resumed")
+                            self._in_collision = False
+                    # Reflect solved angles in sliders
+                    for i, s in enumerate(joint_sliders):
+                        if i < self._n_arm:
+                            s.value = float(np.degrees(ik_q[i]))
 
-                    elif mode == "joint":
-                        # Build command from slider values
-                        cmd = self._robot.get_joint_pos().copy()
-                        for i, s in enumerate(joint_sliders):
-                            if i < self._n_arm:
-                                cmd[i] = float(np.radians(s.value))
-                        if gripper_slider is not None and self._gripper_index is not None:
-                            cmd[self._gripper_index] = float(gripper_slider.value)
+                elif mode == "joint":
+                    # Build command from slider values
+                    cmd = self._robot.get_joint_pos().copy()
+                    for i, s in enumerate(joint_sliders):
+                        if i < self._n_arm:
+                            cmd[i] = float(np.radians(s.value))
+                    if gripper_slider is not None and self._gripper_index is not None:
+                        cmd[self._gripper_index] = float(gripper_slider.value)
+                    n = min(len(cmd), self._nq)
+                    if self._has_self_collision(cmd, n):
+                        if not self._in_collision:
+                            print("[viser] Collision detected — command blocked")
+                            self._in_collision = True
+                    else:
                         self._robot.command_joint_pos(cmd)
+                        if self._in_collision:
+                            print("[viser] Collision cleared — commands resumed")
+                            self._in_collision = False
 
                 time.sleep(self._dt)
 

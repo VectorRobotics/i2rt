@@ -4,7 +4,7 @@ A Python client library for interacting with [I2RT](https://i2rt.com/) products 
 
 [![I2RT](https://github.com/user-attachments/assets/025ac3f0-7af1-4e6f-ab9f-7658c5978f92)](https://i2rt.com/)
 
-> **Full documentation:** see the [`docs/`](./docs) folder or the hosted web docs.
+> 📚 **Full documentation:** [doc.i2rt.com](https://doc.i2rt.com)
 
 ## Features
 
@@ -47,23 +47,22 @@ sudo sh devices/install_devices.sh
 sh scripts/reset_all_can.sh
 ```
 
-For persistent CAN names across multi-arm setups (YAM Cell), see [`docs/getting-started/hardware-setup.md`](./docs/getting-started/hardware-setup.md#persistent-can-ids).
-
 ## YAM Arm
 
 ### Zero-gravity mode
 
 ```bash
-python i2rt/robots/motor_chain_robot.py --channel can0 --gripper_type linear_4310
+python i2rt/robots/motor_chain_robot.py --channel can0 --gripper linear_4310
 ```
 
 ### Python API
 
 ```python
-from i2rt.robots.motor_chain_robot import get_yam_robot
+from i2rt.robots.get_robot import get_yam_robot
+from i2rt.robots.utils import GripperType
 import numpy as np
 
-robot = get_yam_robot(channel="can0", gripper_type="linear_4310")
+robot = get_yam_robot(channel="can0", gripper_type=GripperType.LINEAR_4310)
 
 # Read joint positions (radians)
 q = robot.get_joint_pos()   # shape: (6,)
@@ -76,15 +75,15 @@ robot.command_joint_pos(np.zeros(6))
 
 ```bash
 # Follower arm
-python examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode follower --can-channel can0 --bilateral_kp 0.2
+python examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode follower --can-channel can0 --bilateral-kp 0.2
 
 # Leader arm (teaching handle)
-python examples/minimum_gello/minimum_gello.py --gripper yam_teaching_handle --mode leader --can-channel can1 --bilateral_kp 0.2
+python examples/minimum_gello/minimum_gello.py --gripper yam_teaching_handle --mode leader --can-channel can1 --bilateral-kp 0.2
 ```
 
 - **Top button (press once):** enable synchronisation — follower tracks leader
 - **Top button (press again):** disable synchronisation
-- `--bilateral_kp` controls resistance felt on the leader (0.1–0.2 recommended)
+- `--bilateral-kp` controls resistance felt on the leader (0.1–0.2 recommended)
 
 To inspect leader arm output:
 
@@ -105,7 +104,7 @@ python examples/minimum_gello/minimum_gello.py --mode visualizer_local
 | `crank_4310` | DM4310 | Zero-linkage crank — minimises gripper width |
 | `linear_3507` | DM3507 | Lightweight linear; start closed or run calibration |
 | `linear_4310` | DM4310 | Standard linear; slightly more force than 3507 |
-| `yam_teaching_handle` | — | Leader arm handle with trigger + 2 buttons. See [`docs/products/yam-leader.md`](./docs/products/yam-leader.md) |
+| `yam_teaching_handle` | — | Leader arm handle with trigger + 2 buttons. |
 
 The linear grippers require calibration because their motor travels more than 2π radians over the full stroke — either start with the gripper fully closed, or run the calibration routine.
 
@@ -123,16 +122,14 @@ client = FlowBaseClient(host="172.6.2.20")
 client.set_target_velocity([0.1, 0.0, 0.0], frame="local")
 ```
 
-Full setup, remote layout, API reference, and linear rail docs: [`docs/products/flow-base.md`](./docs/products/flow-base.md).
-
 ## Examples
 
-| Example | Location | Docs |
-|---------|----------|------|
-| Bimanual lead-follower | `examples/bimanual_lead_follower/` | [`docs/examples/bimanual-teleoperation.md`](./docs/examples/bimanual-teleoperation.md) |
-| Record & replay trajectory | `examples/record_replay_trajectory/` | [`docs/examples/record-replay.md`](./docs/examples/record-replay.md) |
-| Single motor PD control | `examples/single_motor_position_pd_control/` | [`docs/examples/motor-control.md`](./docs/examples/motor-control.md) |
-| MuJoCo control interface | `examples/control_with_mujoco/` | [`docs/examples/control-with-mujoco.md`](./docs/examples/control-with-mujoco.md) |
+| Example | Location |
+|---------|----------|
+| Bimanual lead-follower | `examples/bimanual_lead_follower/` |
+| Record & replay trajectory | `examples/record_replay_trajectory/` |
+| Single motor PD control | `examples/single_motor_position_pd_control/` |
+| MuJoCo control interface | `examples/control_with_mujoco/` |
 
 ## Advanced: Motor Configuration
 
